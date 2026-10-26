@@ -43,7 +43,7 @@ HEADERS_JSON = {
     "User-Agent": "rer-explorer/1.0 (python-requests)",
 }
 HEADERS_CSV = {
-    "Accept": "application/vnd.sdmx.data+csv;version=2.0.0, text/csv;q=0.9",
+    "Accept": "text/csv",
     "User-Agent": "rer-explorer/1.0 (python-requests)",
 }
 HEADERS_STRUCT = {
@@ -56,6 +56,19 @@ class IMFError(Exception):
     """Raised when the IMF API cannot be reached or returns an error."""
 
 
+def _empty() -> pd.Series:
+    """Empty monthly series with a DatetimeIndex (safe to compare with Timestamps)."""
+    return pd.Series(dtype=float, index=pd.DatetimeIndex([], name="month"))
+
+
+def _series(d: dict) -> pd.Series:
+    if not d:
+        return _empty()
+    out = pd.Series(d, dtype=float)
+    out.index = pd.DatetimeIndex(out.index)
+    return out.sort_index()
+
+
 # ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
@@ -65,8 +78,8 @@ def _get(url: str, headers: dict, params: dict | None = None, retries: int = 3) 
     for attempt in range(retries):
         try:
             r = requests.get(url, headers=headers, params=params, timeout=TIMEOUT)
-            if r.status_code == 404:
-                return None
+            if r.status_code == 404 or (400 <= r.status_code < 500 and r.status_code != 429):
+                return None  # no data / invalid key for this country
             if r.status_code in (429, 500, 502, 503, 504):
                 last_err = f"HTTP {r.status_code}"
                 time.sleep(1.5 * (attempt + 1))
@@ -125,7 +138,7 @@ def parse_sdmx_json(js: dict) -> pd.Series:
     data = js.get("data", js)
     datasets = data.get("dataSets") or []
     if not datasets:
-        return pd.Series(dtype=float)
+        return _empty()
 
     structs = data.get("structures")
     if structs is None and "structure" in data:
@@ -187,7 +200,7 @@ def parse_sdmx_json(js: dict) -> pd.Series:
             if len(out) > len(best):
                 best = out
 
-    return pd.Series(best, dtype=float).sort_index()
+    return _series(best)
 
 
 def parse_sdmx_csv(text: str) -> pd.Series:
@@ -195,17 +208,17 @@ def parse_sdmx_csv(text: str) -> pd.Series:
     try:
         df = pd.read_csv(io.StringIO(text), dtype=str)
     except Exception:
-        return pd.Series(dtype=float)
+        return _empty()
     cols = {c.upper(): c for c in df.columns}
     tcol, vcol = cols.get("TIME_PERIOD"), cols.get("OBS_VALUE")
     if tcol is None or vcol is None:
-        return pd.Series(dtype=float)
+        return _empty()
     out = {}
     for t, v in zip(df[tcol], df[vcol]):
         ts, f = parse_period(t), _to_float(v)
         if ts is not None and f is not None:
             out[ts] = f
-    return pd.Series(out, dtype=float).sort_index()
+    return _series(out)
 
 
 # ---------------------------------------------------------------------------
@@ -214,21 +227,29 @@ def parse_sdmx_csv(text: str) -> pd.Series:
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_series(flow: str, key: str) -> pd.Series:
     """Fetch one monthly IMF series. Returns an empty Series if no data exists."""
-    url = f"{IMF_BASE}/data/dataflow/{AGENCY}/{flow}/+/{key}"
-    params = {"dimensionAtObservation": "TIME_PERIOD", "attributes": "none", "measures": "all"}
+    url = f"{IMF_BASE}/data/dataflow/{AGENCY}/{flow}/~/{key}"
 
-    s = pd.Series(dtype=float)
-    r = _get(url, HEADERS_JSON, params)
+    # 1) SDMX-CSV (the format the IMF documents in its examples)
+    s = _empty()
+    r = _get(url, HEADERS_CSV, {"c[TIME_PERIOD]": "ge:1976-M01"})
     if r is not None:
-        try:
-            s = parse_sdmx_json(r.json())
-        except ValueError:
-            s = parse_sdmx_csv(r.text)
-    if s.empty:  # fallback: request SDMX-CSV
-        r = _get(url, HEADERS_CSV, {"dimensionAtObservation": "TIME_PERIOD"})
+        s = parse_sdmx_csv(r.text)
+    # 2) Same request without the time filter, in case the filter is rejected
+    if s.empty:
+        r = _get(url, HEADERS_CSV)
         if r is not None:
             s = parse_sdmx_csv(r.text)
+    # 3) SDMX-JSON fallback
+    if s.empty:
+        r = _get(url, HEADERS_JSON)
+        if r is not None:
+            try:
+                s = parse_sdmx_json(r.json())
+            except ValueError:
+                s = parse_sdmx_csv(r.text)
 
+    if s.empty:
+        return _empty()
     s = s[s.index >= START_MONTH]
     s = s[~s.index.duplicated(keep="last")]
     return s.sort_index()
@@ -245,7 +266,7 @@ def _codes_from_structure(js: dict) -> dict[str, str]:
 
 def _available_countries(flow: str, key_tail: str) -> set[str]:
     """Ask the availability endpoint which countries have data for a key pattern."""
-    url = f"{IMF_BASE}/availability/dataflow/{AGENCY}/{flow}/+/*.{key_tail}"
+    url = f"{IMF_BASE}/availability/dataflow/{AGENCY}/{flow}/~/*.{key_tail}"
     r = _get(url, HEADERS_STRUCT, {"mode": "exact"}, retries=2)
     if r is None:
         return set()
@@ -278,7 +299,7 @@ def fetch_country_list() -> tuple[dict[str, str], str]:
     names: dict[str, str] = {}
     note = "IMF CPI codelist"
     try:
-        url = f"{IMF_BASE}/structure/dataflow/{AGENCY}/{CPI_FLOW}/+"
+        url = f"{IMF_BASE}/structure/dataflow/{AGENCY}/{CPI_FLOW}/~"
         r = _get(url, HEADERS_STRUCT, {"references": "descendants", "detail": "full"}, retries=2)
         if r is not None:
             names = _codes_from_structure(r.json())
@@ -303,12 +324,19 @@ def fetch_country_list() -> tuple[dict[str, str], str]:
     return dict(sorted(names.items(), key=lambda kv: kv[1])), note
 
 
-def fetch_fx_per_usd(iso: str) -> pd.Series:
-    """Local currency units per USD. The US is 1 by definition."""
+def fetch_fx_per_usd(iso: str) -> tuple[pd.Series, str]:
+    """Local currency units per USD, plus a note on the source. The US is 1 by definition."""
     if iso == "USA":
         idx = pd.date_range(START_MONTH, pd.Timestamp(date.today()).to_period("M").to_timestamp(), freq="MS")
-        return pd.Series(1.0, index=idx)
-    return fetch_series(FX_FLOW, FX_KEY.format(iso=iso))
+        return pd.Series(1.0, index=idx), "USD (fixed at 1)"
+    s = fetch_series(FX_FLOW, FX_KEY.format(iso=iso))
+    if s.empty and iso == EURO_AREA:
+        # The aggregate may have no ER series. Germany's rate is in euros per USD from 1999 onward.
+        de = fetch_series(FX_FLOW, FX_KEY.format(iso="DEU"))
+        de = de[de.index >= pd.Timestamp("1999-01-01")]
+        if not de.empty:
+            return de, f"EUR per USD from Germany's IMF series (Euro area series unavailable): {coverage(de)}"
+    return s, coverage(s)
 
 
 def fetch_cpi(iso: str) -> pd.Series:
@@ -450,7 +478,7 @@ def main() -> None:
 
     with st.spinner(f"Retrieving IMF data for {c1} and {c2}..."):
         try:
-            e1, e2 = fetch_fx_per_usd(iso1), fetch_fx_per_usd(iso2)
+            (e1, e1_note), (e2, e2_note) = fetch_fx_per_usd(iso1), fetch_fx_per_usd(iso2)
             p1, p2 = fetch_cpi(iso1), fetch_cpi(iso2)
         except IMFError as exc:
             st.error(f"{exc}\n\nThe IMF API may be temporarily unavailable. Try again shortly.")
@@ -458,8 +486,8 @@ def main() -> None:
 
     with st.expander("Data coverage", expanded=False):
         st.markdown(
-            f"- Exchange rate, {c1} per USD: {coverage(e1) if iso1 != 'USA' else 'USD (fixed at 1)'}\n"
-            f"- Exchange rate, {c2} per USD: {coverage(e2) if iso2 != 'USA' else 'USD (fixed at 1)'}\n"
+            f"- Exchange rate, {c1} per USD: {e1_note}\n"
+            f"- Exchange rate, {c2} per USD: {e2_note}\n"
             f"- CPI, {c1}: {coverage(p1)}\n"
             f"- CPI, {c2}: {coverage(p2)}"
         )
